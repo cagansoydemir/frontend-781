@@ -1,0 +1,382 @@
+name: Build APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Accept licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install Gradle
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle-8.7-bin.zip
+          echo "$PWD/gradle-8.7/bin" >> $GITHUB_PATH
+
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/ratnet/shield
+
+          cat > settings.gradle.kts <<'S_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "RATNETShield"
+          include(":app")
+          S_EOF
+
+          cat > build.gradle.kts <<'B_EOF'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          B_EOF
+
+          cat > gradle.properties <<'G_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m
+          G_EOF
+
+          cat > app/build.gradle.kts <<'AB_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.ratnet.shield"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.ratnet.shield"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          AB_EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'M_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:label="RATNET Shield" android:allowBackup="false" android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".ShieldVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:foregroundServiceType="specialUse" android:exported="false">
+                      <intent-filter><action android:name="android.net.VpnService"/></intent-filter>
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="vpn_filter"/>
+                  </service>
+                  <service android:name=".VpnTileService" android:icon="@android:drawable/ic_lock_lock" android:label="RATNET Shield" android:permission="android.permission.BIND_QUICK_SETTINGS_TILE" android:exported="true">
+                      <intent-filter><action android:name="android.service.quicksettings.action.QS_TILE"/></intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          M_EOF
+
+          cat > app/src/main/java/com/ratnet/shield/Shield.kt <<'K_EOF'
+          package com.ratnet.shield
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.ParcelFileDescriptor
+          import android.service.quicksettings.Tile
+          import android.service.quicksettings.TileService
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.ContextCompat
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.util.concurrent.atomic.AtomicBoolean
+          import kotlin.concurrent.thread
+
+          object Blocklist {
+              private val domains = setOf(
+                  "doubleclick.net","googleadservices.com","googlesyndication.com",
+                  "adservice.google.com","ads.yahoo.com","adnxs.com","criteo.com",
+                  "outbrain.com","taboola.com","google-analytics.com","analytics.google.com",
+                  "scorecardresearch.com","quantserve.com","hotjar.com","mixpanel.com",
+                  "connect.facebook.net","graph.facebook.com","ads.facebook.com",
+                  "ads.linkedin.com","ads.tiktok.com","analytics.tiktok.com",
+                  "ads.pinterest.com","adcolony.com","applovin.com","unityads.unity3d.com",
+                  "vungle.com","chartboost.com","inmobi.com","mopub.com","bat.bing.com",
+                  "amazon-adsystem.com"
+              )
+              fun isBlocked(h: String): Boolean {
+                  val n = h.lowercase().trimEnd('.')
+                  if (n.isEmpty()) return false
+                  if (domains.contains(n)) return true
+                  var i = n.indexOf('.')
+                  while (i != -1 && i < n.length - 1) {
+                      if (domains.contains(n.substring(i + 1))) return true
+                      i = n.indexOf('.', i + 1)
+                  }
+                  return false
+              }
+              fun size() = domains.size
+          }
+
+          class ShieldVpnService : VpnService() {
+              private var tun: ParcelFileDescriptor? = null
+              private val running = AtomicBoolean(false)
+              companion object {
+                  const val ACTION_START = "com.ratnet.shield.START"
+                  const val ACTION_STOP = "com.ratnet.shield.STOP"
+                  private const val CH = "shield"
+                  private const val NID = 1001
+              }
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  if (i?.action == ACTION_STOP) stopVpn() else startVpn()
+                  return START_STICKY
+              }
+              private fun startVpn() {
+                  if (running.get()) return
+                  val b = Builder().setSession("RATNET Shield").setMtu(1500)
+                      .addAddress("10.111.222.1", 32).addRoute("0.0.0.0", 0)
+                      .addDnsServer("1.1.1.1").setBlocking(false)
+                  try { b.addDisallowedApplication(packageName) } catch (_: Exception) {}
+                  tun = try { b.establish() } catch (_: Exception) { null } ?: run { stopSelf(); return }
+                  running.set(true)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val c = NotificationChannel(CH, "RATNET Shield", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(c)
+                  }
+                  val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                  val n = NotificationCompat.Builder(this, CH)
+                      .setContentTitle("Koruma aktif").setContentText("${Blocklist.size()} domain engelleniyor")
+                      .setSmallIcon(android.R.drawable.ic_lock_lock).setContentIntent(pi).setOngoing(true).build()
+                  startForeground(NID, n)
+                  thread(isDaemon = true) { loop(tun!!) }
+              }
+              private fun loop(t: ParcelFileDescriptor) {
+                  val inp = FileInputStream(t.fileDescriptor)
+                  val out = FileOutputStream(t.fileDescriptor)
+                  val buf = ByteArray(32767)
+                  while (running.get()) {
+                      val len = try { inp.read(buf) } catch (_: Exception) { break }
+                      if (len <= 0) continue
+                      if (((buf[0].toInt() ushr 4) and 0xF) != 4) continue
+                      if ((buf[9].toInt() and 0xFF) != 17) continue
+                      val ihl = (buf[0].toInt() and 0xF) * 4
+                      if (len < ihl + 8) continue
+                      val dp = ((buf[ihl + 2].toInt() and 0xFF) shl 8) or (buf[ihl + 3].toInt() and 0xFF)
+                      if (dp != 53) continue
+                      val ds = ihl + 8
+                      val dl = len - ds
+                      if (dl < 12) continue
+                      val q = buf.copyOfRange(ds, ds + dl)
+                      val host = extractHost(q)
+                      if (host != null && Blocklist.isBlocked(host)) {
+                          val r = q.copyOf()
+                          r[2] = 0x81.toByte()
+                          r[3] = 0x83.toByte()
+                          try { out.write(buildResp(buf, ihl, r)) } catch (_: Exception) {}
+                      }
+                  }
+              }
+              private fun extractHost(d: ByteArray): String? {
+                  if (d.size < 13) return null
+                  val sb = StringBuilder()
+                  var i = 12
+                  while (i < d.size) {
+                      val l = d[i].toInt() and 0xFF
+                      if (l == 0) break
+                      if (l > 63 || i + 1 + l > d.size) return null
+                      if (sb.isNotEmpty()) sb.append('.')
+                      for (j in 1..l) {
+                          val c = d[i + j].toInt() and 0xFF
+                          if (c in 0x21..0x7E) sb.append(c.toChar()) else return null
+                      }
+                      i += 1 + l
+                  }
+                  return if (sb.isEmpty()) null else sb.toString().lowercase()
+              }
+              private fun buildResp(o: ByteArray, ihl: Int, p: ByteArray): ByteArray {
+                  val total = ihl + 8 + p.size
+                  val b = ByteArray(total)
+                  System.arraycopy(o, 0, b, 0, ihl)
+                  for (i in 0 until 4) {
+                      b[12 + i] = o[16 + i]
+                      b[16 + i] = o[12 + i]
+                  }
+                  b[8] = 64
+                  b[2] = ((total shr 8) and 0xFF).toByte()
+                  b[3] = (total and 0xFF).toByte()
+                  b[10] = 0
+                  b[11] = 0
+                  b[ihl] = o[ihl + 2]
+                  b[ihl + 1] = o[ihl + 3]
+                  b[ihl + 2] = o[ihl]
+                  b[ihl + 3] = o[ihl + 1]
+                  val ul = 8 + p.size
+                  b[ihl + 4] = ((ul shr 8) and 0xFF).toByte()
+                  b[ihl + 5] = (ul and 0xFF).toByte()
+                  b[ihl + 6] = 0
+                  b[ihl + 7] = 0
+                  System.arraycopy(p, 0, b, ihl + 8, p.size)
+                  return b
+              }
+              private fun stopVpn() {
+                  running.set(false)
+                  try { tun?.close() } catch (_: Exception) {}
+                  tun = null
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+              override fun onDestroy() { stopVpn(); super.onDestroy() }
+          }
+
+          class VpnTileService : TileService() {
+              override fun onClick() {
+                  super.onClick()
+                  val t = qsTile ?: return
+                  val s = t.state != Tile.STATE_ACTIVE
+                  val i = Intent(this, ShieldVpnService::class.java).apply {
+                      action = if (s) ShieldVpnService.ACTION_START else ShieldVpnService.ACTION_STOP
+                  }
+                  if (s) startForegroundService(i) else startService(i)
+                  t.state = if (s) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+                  t.updateTile()
+              }
+          }
+
+          class MainActivity : AppCompatActivity() {
+              private val REQ = 1001
+              private lateinit var prefs: SharedPreferences
+              private lateinit var status: TextView
+              private lateinit var btn: Button
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  prefs = getSharedPreferences("shield", MODE_PRIVATE)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(60, 200, 60, 60)
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
+                  val title = TextView(this).apply {
+                      text = "RATNET Shield"
+                      textSize = 30f
+                      setTypeface(null, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                  }
+                  val sub = TextView(this).apply {
+                      text = "Reklam ve tracker engelleyici"
+                      textSize = 14f
+                      setPadding(0, 10, 0, 60)
+                      gravity = Gravity.CENTER
+                  }
+                  status = TextView(this).apply {
+                      textSize = 20f
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 50)
+                  }
+                  btn = Button(this).apply {
+                      textSize = 16f
+                      setOnClickListener { toggle() }
+                  }
+                  val info = TextView(this).apply {
+                      textSize = 12f
+                      gravity = Gravity.CENTER
+                      text = "Kara liste: ${Blocklist.size()} domain"
+                  }
+                  root.addView(title)
+                  root.addView(sub)
+                  root.addView(status)
+                  root.addView(btn)
+                  root.addView(info)
+                  setContentView(root)
+                  refresh()
+              }
+              private fun refresh() {
+                  if (prefs.getBoolean("active", false)) {
+                      status.text = "KORUMA AKTIF"
+                      status.setTextColor(Color.parseColor("#22C55E"))
+                      btn.text = "DURDUR"
+                  } else {
+                      status.text = "KORUMA KAPALI"
+                      status.setTextColor(Color.parseColor("#EF4444"))
+                      btn.text = "BASLAT"
+                  }
+              }
+              private fun toggle() {
+                  if (prefs.getBoolean("active", false)) {
+                      startService(Intent(this, ShieldVpnService::class.java).apply {
+                          action = ShieldVpnService.ACTION_STOP
+                      })
+                      prefs.edit().putBoolean("active", false).apply()
+                      refresh()
+                  } else {
+                      val p = VpnService.prepare(this)
+                      if (p != null) startActivityForResult(p, REQ) else start()
+                  }
+              }
+              override fun onActivityResult(rc: Int, rr: Int, d: Intent?) {
+                  super.onActivityResult(rc, rr, d)
+                  if (rc == REQ && rr == Activity.RESULT_OK) start()
+              }
+              private fun start() {
+                  ContextCompat.startForegroundService(this,
+                      Intent(this, ShieldVpnService::class.java).apply {
+                          action = ShieldVpnService.ACTION_START
+                      })
+                  prefs.edit().putBoolean("active", true).apply()
+                  refresh()
+              }
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+          }
+          K_EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RATNET-Shield-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
